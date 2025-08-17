@@ -1,0 +1,520 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Pixel Farmer Prototype</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  body { background:#2b2f33; color:#e6f0d8; font-family:monospace; display:flex; flex-direction:column; align-items:center; gap:12px; padding:18px; }
+  canvas { image-rendering: pixelated; background:#9fcf6b; border:6px solid #213; }
+  .ui { max-width:900px; width:100%; display:flex; justify-content:space-between; align-items:center; gap:12px; }
+  .panel { background:#1b1f20; padding:8px 12px; border-radius:6px; color:#dfeee0; }
+  .controls { font-size:14px; }
+  .legend { display:flex; gap:10px; align-items:center; }
+  .tool { padding:6px 8px; border-radius:4px; background:#283; }
+  .selected { outline:2px solid #d9ffb3; transform:translateY(-2px); }
+</style>
+</head>
+<body>
+  <h2>Pixel Farmer — Prototype</h2>
+  <div class="ui">
+    <div class="panel controls">
+      <div><strong>Move:</strong> Arrow keys / WASD &nbsp; <strong>Use tool:</strong> Z</div>
+      <div><strong>Select tool:</strong> 1 Hoe | 2 Seed Bag | 3 Watering Can</div>
+      <div style="margin-top:6px; font-size:13px; color:#bcd;">Tip: Tools affect the tile you're facing. Seeding can be used anywhere but only affects farmable plots. Watering only changes tilled tiles.</div>
+    </div>
+    <div class="panel legend" id="toolLegend"></div>
+  </div>
+
+  <canvas id="game" width="640" height="480"></canvas>
+
+<script>
+/*
+  Pixel Farmer Prototype
+  - Pure HTML5 Canvas + JS
+  - Player sprite generated at runtime (pixel art scale-up)
+  - 10x10 farmable patch centered in a larger grass map
+  - Tools: Hoe (tilled), Seed Bag (seed), Watering Can (water tilled)
+  - Number keys choose tools; Z uses tool on the tile in front of the player
+  - Walking animation + tool-use animation
+  - speedModifier variable for easy running speed changes
+*/
+
+// CONFIG
+const TILE = 16;               // base tile pixel size (unscaled)
+const SCALE = 3;               // pixel-upscale factor for display
+const DISPLAY_TILE = TILE * SCALE;
+const MAP_COLS = 20;
+const MAP_ROWS = 15;
+const FARM_SIZE = 10;          // the 10x10 farmable patch
+const FPS = 60;
+
+const speedModifier = 1.0;     // multiply movement speed (set >1 to run later)
+const walkingSpeed = 1.2 * speedModifier;  // base movement speed (pixels per frame in base coordinate)
+const animationSpeed = 8;      // frames per animation step
+
+// Canvas setup
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+// Resize canvas to match map (scaled)
+canvas.width = MAP_COLS * DISPLAY_TILE;
+canvas.height = MAP_ROWS * DISPLAY_TILE;
+
+// Game State
+const player = {
+  x: Math.floor(MAP_COLS/2) * TILE + TILE/2,
+  y: Math.floor(MAP_ROWS/2) * TILE + TILE/2,
+  vx: 0,
+  vy: 0,
+  dir: 'down', // up, down, left, right
+  frame: 0,
+  animCounter: 0,
+  usingTool: false,
+  useCounter: 0
+};
+
+const tools = [
+  { id: 1, name: 'Hoe', key: '1' },
+  { id: 2, name: 'Seed Bag', key: '2' },
+  { id: 3, name: 'Watering Can', key: '3' }
+];
+let selectedTool = 1;
+
+// Map tiles: 0=grass (not farmable), 1=farmable untouched, 2=tilled, 3=tilled+seeded, 4=tilled+watered, 5=tilled+seed+water
+const map = [];
+for (let r=0; r<MAP_ROWS; r++){
+  map[r]=[];
+  for (let c=0; c<MAP_COLS; c++){
+    map[r][c] = 0; // default grass
+  }
+}
+// Create a centered 10x10 farmable patch
+const startCol = Math.floor((MAP_COLS - FARM_SIZE)/2);
+const startRow = Math.floor((MAP_ROWS - FARM_SIZE)/2);
+for (let r=0; r<FARM_SIZE; r++){
+  for (let c=0; c<FARM_SIZE; c++){
+    map[startRow + r][startCol + c] = 1; // farmable
+  }
+}
+
+// Keyboard input
+const keys = {};
+window.addEventListener('keydown', e=>{
+  keys[e.key] = true;
+  // tool selection
+  if (e.key === '1' || e.key === '2' || e.key === '3') {
+    selectedTool = Number(e.key);
+    renderLegend();
+  }
+  // prevent scroll on arrow keys
+  if (["ArrowUp","ArrowDown","ArrowLeft","ArrowRight"," "].includes(e.key)) e.preventDefault();
+});
+window.addEventListener('keyup', e=>{
+  keys[e.key] = false;
+});
+
+// ----------------- PIXEL SPRITE GENERATORS -----------------
+// We'll generate small pixel-sprites on offscreen canvases, then draw scaled-up to main canvas.
+// Character is 3-wide animation frames for each direction
+
+function makePlayerSpriteSheet(){
+  const frames = 3;
+  const sw = TILE * frames;
+  const sh = TILE * 4; // 4 directions
+  const s = document.createElement('canvas');
+  s.width = sw;
+  s.height = sh;
+  const c = s.getContext('2d');
+
+  // simple palette
+  const skin = '#F2CBA3';
+  const shirt = '#2b8f6b';
+  const pants = '#345';
+  const hat = '#b5651d';
+  const outline = '#111';
+
+  // draw for each direction (rows: down, left, right, up)
+  const drawFrame = (fx, fy, flip=false, walkPhase=0) => {
+    const px = fx * TILE, py = fy * TILE;
+    // clear
+    c.fillStyle = 'transparent';
+    c.clearRect(px,py,TILE,TILE);
+    // body
+    // simple pixel farmer (8x8-ish)
+    // face
+    c.fillStyle = skin;
+    c.fillRect(px+4,py+2,4,3);
+    // eyes
+    c.fillStyle = outline;
+    c.fillRect(px+5,py+3,1,1);
+    c.fillRect(px+7,py+3,1,1);
+    // hat brim
+    c.fillStyle = hat;
+    c.fillRect(px+3,py+1,6,1);
+    // torso
+    c.fillStyle = shirt;
+    c.fillRect(px+3,py+5,6,4);
+    // legs (walking variation)
+    c.fillStyle = pants;
+    if (walkPhase === 1) {
+      c.fillRect(px+3,py+9,2,3);
+      c.fillRect(px+7,py+8,2,4);
+    } else if (walkPhase === 2) {
+      c.fillRect(px+3,py+8,2,4);
+      c.fillRect(px+7,py+9,2,3);
+    } else {
+      c.fillRect(px+3,py+8,2,4);
+      c.fillRect(px+6,py+8,2,4);
+    }
+    // outline
+    c.strokeStyle = outline;
+    c.lineWidth = 1;
+    c.strokeRect(px+3.5,py+1.5,5,6.5);
+  };
+
+  // Create rows
+  // Down (row 0)
+  for (let f=0; f<frames; f++){
+    drawFrame(f,0, false, f); // walking phases 0..2
+  }
+  // Left (row 1)
+  for (let f=0; f<frames; f++){
+    drawFrame(f,1, true, f);
+    // add little tool-holding marker for left
+    c.fillStyle = '#5b3';
+    c.fillRect(f*TILE+1, TILE*1+6, 2, 2);
+  }
+  // Right (row 2)
+  for (let f=0; f<frames; f++){
+    drawFrame(f,2, false, f);
+    c.fillStyle = '#5b3';
+    c.fillRect(f*TILE+13-1, TILE*2+6, 2, 2);
+  }
+  // Up (row 3)
+  for (let f=0; f<frames; f++){
+    drawFrame(f,3, false, f);
+  }
+
+  return s;
+}
+
+function makeToolIcons(){
+  // small 16x16 icons
+  const s = document.createElement('canvas');
+  s.width = 16*3;
+  s.height = 16;
+  const c = s.getContext('2d');
+  // Hoe
+  c.fillStyle = '#774';
+  c.fillRect(2,4,10,2);
+  c.fillStyle = '#222';
+  c.fillRect(4,2,2,8);
+  // Seed bag
+  c.fillStyle = '#b36';
+  c.fillRect(20,4,8,8);
+  c.fillStyle = '#fff';
+  c.fillRect(22,6,2,2);
+  // Watering can
+  c.fillStyle = '#2f8';
+  c.fillRect(36,6,8,4);
+  c.fillStyle = '#2a5';
+  c.fillRect(44,4,2,2);
+  return s;
+}
+
+const playerSpriteSheet = makePlayerSpriteSheet();
+const toolIcons = makeToolIcons();
+
+// UI legend render
+const toolLegend = document.getElementById('toolLegend');
+function renderLegend(){
+  toolLegend.innerHTML = '';
+  tools.forEach(t=>{
+    const div = document.createElement('div');
+    div.className = 'tool';
+    if (t.id === selectedTool) div.className = 'tool selected';
+    div.textContent = `${t.id} ${t.name}`;
+    toolLegend.appendChild(div);
+  });
+}
+renderLegend();
+
+// ----------------- GAME LOGIC -----------------
+function tileCoord(px, py){
+  return { c: Math.floor(px / TILE), r: Math.floor(py / TILE) };
+}
+
+function clampPlayer(){
+  // keep within map boundaries (as pixels)
+  const half = TILE/2;
+  player.x = Math.max(half, Math.min(player.x, MAP_COLS*TILE - half));
+  player.y = Math.max(half, Math.min(player.y, MAP_ROWS*TILE - half));
+}
+
+function facingTile(){
+  // compute tile in front of the player based on direction
+  let tx = player.x, ty = player.y;
+  const offset = TILE; // target the adjacent tile
+  if (player.dir === 'up') ty -= offset;
+  if (player.dir === 'down') ty += offset;
+  if (player.dir === 'left') tx -= offset;
+  if (player.dir === 'right') tx += offset;
+  const {c,r} = tileCoord(tx, ty);
+  if (r < 0 || r >= MAP_ROWS || c < 0 || c >= MAP_COLS) return null;
+  return {c,r};
+}
+
+function useToolOnTile(toolId, c, r){
+  // current map states reference:
+  // 0 grass
+  // 1 farmable untouched
+  // 2 tilled
+  // 3 tilled+seed
+  // 4 tilled+water
+  // 5 tilled+seed+water
+  const val = map[r][c];
+  if (toolId === 1) { // Hoe -> till
+    // tilled applies only to farmable tiles
+    if (val === 1) map[r][c] = 2;
+    // tilled again? no-op
+    return;
+  }
+  if (toolId === 2) { // Seed Bag -> seed if tilled OR can be used anywhere but only farmable tiles get influence
+    if (val === 2) map[r][c] = 3;
+    if (val === 4) map[r][c] = 5; // water+seed
+    // seeding on non-farmable (grass) does nothing visually, but still allowed (no change)
+    return;
+  }
+  if (toolId === 3) { // Watering can -> change to watered only if tilled (2 or 3)
+    if (val === 2) map[r][c] = 4;
+    if (val === 3) map[r][c] = 5;
+    return;
+  }
+}
+
+// tool use triggers animation and applies effect to facing tile
+function attemptUseTool(){
+  if (player.usingTool) return; // already mid-use
+  player.usingTool = true;
+  player.useCounter = 0;
+  // apply effect at half of use duration for good visual feedback
+  // we'll apply on specific tick in the update loop
+}
+
+// ----------------- DRAW -----------------
+function drawTile(cIdx, rIdx){
+  const x = cIdx * DISPLAY_TILE;
+  const y = rIdx * DISPLAY_TILE;
+  const tileState = map[rIdx][cIdx];
+
+  // base texture: grass
+  ctx.fillStyle = '#5c9e4b'; // nicer green
+  ctx.fillRect(x,y,DISPLAY_TILE,DISPLAY_TILE);
+  // some simple noise/variation
+  if ((cIdx + rIdx) % 2 === 0) {
+    ctx.fillStyle = 'rgba(0,0,0,0.04)';
+    ctx.fillRect(x,y,DISPLAY_TILE,DISPLAY_TILE);
+  }
+
+  // if farmable untouched, draw a "plow border"
+  if (tileState === 1) {
+    ctx.fillStyle = '#417e31';
+    ctx.fillRect(x+DISPLAY_TILE*0.08, y+DISPLAY_TILE*0.08, DISPLAY_TILE*0.84, DISPLAY_TILE*0.84);
+  }
+  // tilled
+  if (tileState === 2 || tileState === 3 || tileState === 4 || tileState === 5) {
+    // darker, furrowed soil
+    ctx.fillStyle = '#6b3f2b';
+    ctx.fillRect(x+DISPLAY_TILE*0.06, y+DISPLAY_TILE*0.06, DISPLAY_TILE*0.88, DISPLAY_TILE*0.88);
+    // a simple furrow pattern
+    ctx.strokeStyle = 'rgba(0,0,0,0.08)';
+    ctx.lineWidth = Math.max(1, SCALE*0.6);
+    for (let i=0;i<3;i++){
+      ctx.beginPath();
+      const yy = y + DISPLAY_TILE*0.22 + i*(DISPLAY_TILE*0.18);
+      ctx.moveTo(x+DISPLAY_TILE*0.14, yy);
+      ctx.lineTo(x+DISPLAY_TILE*0.86, yy);
+      ctx.stroke();
+    }
+  }
+  // seed overlay
+  if (tileState === 3 || tileState === 5) {
+    // small green sprout
+    ctx.fillStyle = '#8af';
+    ctx.fillStyle = '#9eea8a';
+    const cx = x + DISPLAY_TILE*0.5, cy = y + DISPLAY_TILE*0.45;
+    ctx.fillRect(cx - SCALE*1, cy - SCALE*2, SCALE*2, SCALE*3);
+    ctx.fillRect(cx, cy - SCALE*3, SCALE*2, SCALE*1);
+  }
+  // watered overlay (blue sheen)
+  if (tileState === 4 || tileState === 5) {
+    ctx.fillStyle = 'rgba(95,160,255,0.15)';
+    ctx.fillRect(x+DISPLAY_TILE*0.06, y+DISPLAY_TILE*0.06, DISPLAY_TILE*0.88, DISPLAY_TILE*0.88);
+  }
+  // grid
+  ctx.strokeStyle = 'rgba(0,0,0,0.06)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(x+0.5, y+0.5, DISPLAY_TILE-1, DISPLAY_TILE-1);
+}
+
+// draw player scaled sprite at pixel-perfect coordinates (scale-up)
+function drawPlayer(){
+  // convert player's position from base pixels (TILE scale) to DISPLAY pixels
+  const drawX = Math.round(player.x / TILE * DISPLAY_TILE);
+  const drawY = Math.round(player.y / TILE * DISPLAY_TILE);
+
+  // find frame based on direction and player.frame
+  const dirMap = { down:0, left:1, right:2, up:3 };
+  const row = dirMap[player.dir];
+  const frames = 3;
+  const f = player.frame % frames;
+
+  // draw the correct source rectangle from the playerSpriteSheet, then scale
+  const sx = f * TILE;
+  const sy = row * TILE;
+  // draw scaled manually (nearest neighbor) by drawing offscreen to temp canvas and then scale with imageSmoothingEnabled=false
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(playerSpriteSheet, sx, sy, TILE, TILE, drawX - (DISPLAY_TILE/2), drawY - (DISPLAY_TILE/2), DISPLAY_TILE, DISPLAY_TILE);
+
+  // if using tool, draw a tool overlay (simple rectangle) near the sprite based on direction to show action
+  if (player.usingTool) {
+    const usePhase = Math.floor(player.useCounter / 6); // small phases
+    ctx.fillStyle = '#f7d4a1';
+    let ox=0, oy=0;
+    if (player.dir === 'down') { oy = DISPLAY_TILE/2 + SCALE*2 + usePhase*2; }
+    if (player.dir === 'up') { oy = -DISPLAY_TILE/2 - SCALE*2 - usePhase*2; }
+    if (player.dir === 'left') { ox = -DISPLAY_TILE/2 - SCALE*4 - usePhase*2; }
+    if (player.dir === 'right') { ox = DISPLAY_TILE/2 + SCALE*2 + usePhase*2; }
+    const toolW = DISPLAY_TILE*0.3, toolH = DISPLAY_TILE*0.12;
+    ctx.fillRect(drawX + ox - toolW/2, drawY + oy, toolW, toolH);
+    // draw tool icon small above/beside the tool rect
+    ctx.fillStyle = '#000';
+    ctx.font = `${Math.max(8, SCALE*5)}px monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillText(['','H','S','W'][selectedTool], drawX + ox, drawY + oy + toolH*0.75);
+  }
+}
+
+// ----------------- UPDATE LOOP -----------------
+let lastTime = performance.now();
+function update(dt){
+  // input movement (WASD or arrows)
+  let moveX = 0, moveY = 0;
+  if (keys['ArrowUp'] || keys['w']) moveY -= 1;
+  if (keys['ArrowDown'] || keys['s']) moveY += 1;
+  if (keys['ArrowLeft'] || keys['a']) moveX -= 1;
+  if (keys['ArrowRight'] || keys['d']) moveX += 1;
+
+  const moving = (moveX !== 0 || moveY !== 0);
+  if (moving){
+    // set direction for facing
+    if (Math.abs(moveX) > Math.abs(moveY)) {
+      player.dir = moveX > 0 ? 'right' : 'left';
+    } else {
+      player.dir = moveY > 0 ? 'down' : 'up';
+    }
+    // apply normalized speed so diagonal isn't faster
+    const mag = Math.sqrt(moveX*moveX + moveY*moveY);
+    const nx = (moveX / (mag || 1)) * walkingSpeed;
+    const ny = (moveY / (mag || 1)) * walkingSpeed;
+    player.x += nx;
+    player.y += ny;
+    // animate walking: advance animCounter
+    player.animCounter += 1;
+    if (player.animCounter >= animationSpeed){
+      player.frame = (player.frame + 1) % 3;
+      player.animCounter = 0;
+    }
+  } else {
+    // idle frame
+    player.frame = 1; // center frame
+    player.animCounter = 0;
+  }
+
+  // tool use handling
+  if (keys['z'] || keys['Z']) {
+    if (!player.usingTool) attemptUseTool();
+  }
+
+  if (player.usingTool) {
+    player.useCounter++;
+    // Apply effect at a particular useCounter tick
+    if (player.useCounter === 8) {
+      const t = facingTile();
+      if (t) useToolOnTile(selectedTool, t.c, t.r);
+    }
+    // end animation after certain ticks
+    if (player.useCounter > 20) {
+      player.usingTool = false;
+      player.useCounter = 0;
+    }
+  }
+
+  clampPlayer();
+}
+
+// ----------------- RENDER LOOP -----------------
+function render(){
+  // clear (fill background)
+  ctx.fillStyle = '#9fcf6b';
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+
+  // draw tiles
+  for (let r=0;r<MAP_ROWS;r++){
+    for (let c=0;c<MAP_COLS;c++){
+      drawTile(c,r);
+    }
+  }
+
+  // draw a highlight for the facing tile (optional)
+  const ft = facingTile();
+  if (ft) {
+    ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(ft.c*DISPLAY_TILE+3, ft.r*DISPLAY_TILE+3, DISPLAY_TILE-6, DISPLAY_TILE-6);
+  }
+
+  // draw player
+  drawPlayer();
+
+  // top-left HUD (tool icon and name)
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(toolIcons, (selectedTool-1)*16, 0, 16, 16, 10, 10, 16*SCALE, 16*SCALE);
+  ctx.fillStyle = '#f0ffd6';
+  ctx.font = `${12*SCALE/2}px monospace`;
+  ctx.fillText(`Tool: ${tools.find(t=>t.id===selectedTool).name}`, 10 + 16*SCALE + 8, 12 + 12);
+}
+
+// ----------------- MAIN LOOP -----------------
+function loop(timestamp){
+  const dt = timestamp - lastTime;
+  lastTime = timestamp;
+
+  update(dt);
+  render();
+
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+// ----------------- Extra: click to toggle sample farmable tile for testing -----------------
+canvas.addEventListener('click', e=>{
+  // convert click to tile coords
+  const rect = canvas.getBoundingClientRect();
+  const cx = (e.clientX - rect.left);
+  const cy = (e.clientY - rect.top);
+  const c = Math.floor(cx / DISPLAY_TILE);
+  const r = Math.floor(cy / DISPLAY_TILE);
+  if (r >= 0 && r < MAP_ROWS && c >=0 && c < MAP_COLS) {
+    // cycle the state for quick testing
+    map[r][c] = (map[r][c] + 1) % 6;
+  }
+});
+
+// initial draw
+render();
+
+</script>
+</body>
+</html>
